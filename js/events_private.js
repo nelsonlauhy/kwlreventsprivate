@@ -689,7 +689,7 @@
 
         <div class="event-cta small text-primary d-flex align-items-start justify-content-end">
           ${remainTxt ? `<div class="small text-muted me-3">${esc(remainTxt)}</div>` : ""}
-          <div>Details &raquo;</div>
+          <div>Details</div>
         </div>
       </div>
     `;
