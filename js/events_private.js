@@ -1,14 +1,18 @@
 // Internal Events (Firestore v8)
-// Shows BOTH visibility: "private" and "public" (published, upcoming)
-// Adds robust map handling with new `hmapsUrl` field:
-//   - Always show a Google Maps LINK (priority: hmapsUrl > mapsUrl > placeId > lat/lng > address)
-//   - Only show inline EMBED when we have precise data (placeId or lat/lng) or an Embed API key
-// Optional fields supported on event or resource (event takes precedence):
-//   hmapsUrl, mapsUrl, mapsPlaceId, lat, lng, address
+// - Default month view
+// - Shows BOTH visibility: private + public
+// - Includes past events
+// - Past events are grey
+// - List auto-scrolls to current day / nearest upcoming event
+// - Thumbnail title: 27th @ 10:31am
+// - Add to Calendar: Google / Outlook / ICS
+// - Robust map handling with hmapsUrl / mapsUrl / placeId / lat/lng / address
+
 (function() {
   // ---------- DOM ----------
   const containerList = document.getElementById("eventsContainer");
   const containerCal  = document.getElementById("calendarContainer");
+  const contentViewport = document.getElementById("contentViewport");
   const branchFilter  = document.getElementById("branchFilter");
   const visibilityFilter = document.getElementById("visibilityFilter");
   const searchInput   = document.getElementById("searchInput");
@@ -42,70 +46,84 @@
   const evTitleEl    = document.getElementById("evTitle");
   const evMetaEl     = document.getElementById("evMeta");
   const evDateLineEl = document.getElementById("evDateLine");
-
-  // NEW: Banner inside modal
   const evBannerWrap = document.getElementById("evBannerWrap");
   const evBannerImg  = document.getElementById("evBannerImg");
-
-  // Address + map controls
   const evAddressRow = document.getElementById("evAddressRow");
   const evAddressText = document.getElementById("evAddressText");
   const evMapLink   = document.getElementById("evMapLink");
   const evMapToggle = document.getElementById("evMapToggle");
   const evMapEmbed  = document.getElementById("evMapEmbed");
   const evMapIframe = document.getElementById("evMapIframe");
-
   const evShortDescEl= document.getElementById("evShortDesc");
   const evDetailDescEl = document.getElementById("evDetailDesc");
   const evCapacityEl = document.getElementById("evCapacity");
   const btnOpenRegister = document.getElementById("btnOpenRegister");
 
+  // Add to Calendar buttons
+  const addCalGoogle = document.getElementById("addCalGoogle");
+  const addCalOutlook = document.getElementById("addCalOutlook");
+  const addCalIcs = document.getElementById("addCalIcs");
+
   // ---------- Config ----------
-  // Optional: set in firebaseConfig.js to enable precise embed:
-  //   window.MAPS_EMBED_API_KEY = "YOUR_GOOGLE_MAPS_EMBED_API_KEY";
-  const MAPS_EMBED_API_KEY = (typeof window !== "undefined" && window.MAPS_EMBED_API_KEY) ? String(window.MAPS_EMBED_API_KEY) : null;
-  // "auto": show embed when precise (placeId/latlng) or API key + address; "link": link-only
+  const MAPS_EMBED_API_KEY = (typeof window !== "undefined" && window.MAPS_EMBED_API_KEY)
+    ? String(window.MAPS_EMBED_API_KEY)
+    : null;
   const MAP_MODE = "auto";
 
   // ---------- State ----------
   let allEvents = [];
   let filtered  = [];
   let regTarget = null;
+  let currentDetailEvent = null;
   let unsubscribeEvents = null;
-
-  // Cache resource docs (for address lookup)
   const resourceCache = Object.create(null);
 
-  // calendar state
-  let currentView = "list";
+  let currentView = "month";
   let cursorDate  = truncateToDay(new Date());
 
   // ---------- Utils ----------
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, m => (
     { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[m]
   ));
+
   function stripHtmlToText(html) {
-    const tmp = document.createElement("div"); tmp.innerHTML = html || "";
+    const tmp = document.createElement("div");
+    tmp.innerHTML = html || "";
     return (tmp.textContent || tmp.innerText || "").trim();
   }
+
   function toDate(ts) {
     if (!ts) return null;
     if (typeof ts.toDate === "function") return ts.toDate();
     const d = new Date(ts);
     return isNaN(d) ? null : d;
   }
+
   function fmtDateTime(d) {
     if (!d) return "";
     const pad = (n) => String(n).padStart(2, "0");
     return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
+
   function fmtDate(d) {
     if (!d) return "";
     return d.toLocaleDateString(undefined, { weekday:"short", month:"short", day:"numeric", year:"numeric" });
   }
-  function truncateToDay(d) { const x=new Date(d); x.setHours(0,0,0,0); return x; }
-  function monthKey(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`; }
-  function monthLabel(d) { return d.toLocaleString(undefined, { month: "long", year: "numeric" }); }
+
+  function truncateToDay(d) {
+    const x = new Date(d);
+    x.setHours(0,0,0,0);
+    return x;
+  }
+
+  function monthKey(d) {
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+  }
+
+  function monthLabel(d) {
+    return d.toLocaleString(undefined, { month: "long", year: "numeric" });
+  }
+
   function normalizeHex(c) {
     if (!c) return "#3b82f6";
     let x = String(c).trim();
@@ -113,6 +131,7 @@
     if (x.length === 4) x = "#" + x[1]+x[1]+x[2]+x[2]+x[3]+x[3];
     return x.toLowerCase();
   }
+
   function idealTextColor(bgHex) {
     const h = normalizeHex(bgHex).slice(1);
     const r = parseInt(h.substring(0,2), 16);
@@ -121,47 +140,325 @@
     const yiq = (r*299 + g*587 + b*114) / 1000;
     return yiq >= 150 ? "#000000" : "#ffffff";
   }
+
   function ensureHttps(url) {
     let s = String(url || "").trim();
     if (!s) return "";
-    if (s.startsWith("ttps://")) s = "h" + s; // fix missing 'h'
-    if (!/^https?:\/\//i.test(s)) s = "https://" + s;
+    if (s.startsWith("ttps://")) s = "h" + s;
+    if (/^gs:\/\//i.test(s)) return "";
+    if (!/^https?:\/\//i.test(s) && !s.startsWith("/")) s = "https://" + s;
     return s;
   }
+
   function clearRegAlerts() {
-    [regWarn, regErr, regOk].forEach(el => { el.classList.add("d-none"); el.textContent=""; });
+    [regWarn, regErr, regOk].forEach(el => {
+      el.classList.add("d-none");
+      el.textContent = "";
+    });
   }
 
-  // --- Banner helpers ---
+  function isPastEvent(ev) {
+    const now = new Date();
+    const end = toDate(ev.end) || toDate(ev.start);
+    return !!(end && end < now);
+  }
+
+  function canRegister(ev) {
+    const now = new Date();
+    if (ev.status !== "published") return false;
+    const v = (ev.visibility || "").toLowerCase();
+    if (v !== "public" && v !== "private") return false;
+    if (ev.allowRegistration === false) return false;
+
+    const opens = toDate(ev.regOpensAt);
+    const closes = toDate(ev.regClosesAt);
+    if (opens && now < opens) return false;
+    if (closes && now > closes) return false;
+
+    if (typeof ev.remaining === "number" && ev.remaining <= 0) return false;
+
+    const start = toDate(ev.start);
+    if (start && now > start) return false;
+
+    return true;
+  }
+
+  function getEventDisplayColors(ev, fallbackDisabled = false) {
+    const past = isPastEvent(ev);
+
+    if (past) {
+      return {
+        bg: "#e5e7eb",
+        border: "#d1d5db",
+        text: "#6b7280",
+        past: true,
+        disabled: true
+      };
+    }
+
+    const disabled = fallbackDisabled || !canRegister(ev);
+    if (disabled) {
+      return {
+        bg: "#f1f5f9",
+        border: "#e2e8f0",
+        text: "#64748b",
+        past: false,
+        disabled: true
+      };
+    }
+
+    const bg = normalizeHex(ev.color || "#3b82f6");
+    return {
+      bg,
+      border: bg,
+      text: idealTextColor(bg),
+      past: false,
+      disabled: false
+    };
+  }
+
+  function getCurrentMonthKey() {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function getOrdinalDay(n) {
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    if (mod10 === 1 && mod100 !== 11) return `${n}st`;
+    if (mod10 === 2 && mod100 !== 12) return `${n}nd`;
+    if (mod10 === 3 && mod100 !== 13) return `${n}rd`;
+    return `${n}th`;
+  }
+
+  function formatThumbTopTitle(startDate) {
+    if (!startDate) return "";
+    const day = getOrdinalDay(startDate.getDate());
+    const time = startDate.toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+      hour12: true
+    }).toLowerCase().replace(/\s/g, "");
+    return `${day} @ ${time}`;
+  }
+
+  function startOfWeek(d) {
+    const x = truncateToDay(d);
+    x.setDate(x.getDate() - x.getDay());
+    return x;
+  }
+
+  function addDays(d, n) {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+  }
+
+  function overlaps(aStart, aEnd, bStart, bEnd) {
+    return aStart < bEnd && aEnd > bStart;
+  }
+
+  function activeViewButton() {
+    [btnMonth,btnWeek,btnDay,btnList].forEach(b => b.classList.remove("active"));
+    if (currentView === "month") btnMonth.classList.add("active");
+    else if (currentView === "week") btnWeek.classList.add("active");
+    else if (currentView === "day") btnDay.classList.add("active");
+    else btnList.classList.add("active");
+  }
+
+  function forceDefaultMonthView() {
+    currentView = "month";
+    cursorDate = truncateToDay(new Date());
+    render();
+  }
+
+  function scrollListToCurrentDay() {
+    if (currentView !== "list") return;
+    if (!contentViewport) return;
+
+    requestAnimationFrame(() => {
+      const now = new Date();
+      const todayStart = new Date(now);
+      todayStart.setHours(0, 0, 0, 0);
+
+      const cards = Array.from(containerList.querySelectorAll(".event-card[data-start-ts]"));
+
+      let target = cards.find(card => {
+        const ts = Number(card.getAttribute("data-start-ts") || 0);
+        return ts >= todayStart.getTime();
+      });
+
+      if (!target) {
+        const targetMonthKey = getCurrentMonthKey();
+        target = containerList.querySelector(`[data-month-key="${targetMonthKey}"]`);
+      }
+
+      if (!target) return;
+
+      const viewportRect = contentViewport.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const offset = targetRect.top - viewportRect.top + contentViewport.scrollTop - 12;
+
+      contentViewport.scrollTo({
+        top: Math.max(0, offset),
+        behavior: "smooth"
+      });
+    });
+  }
+
+  // ---------- Add to Calendar helpers ----------
+  function escapeIcsText(str) {
+    return String(str || "")
+      .replace(/\\/g, "\\\\")
+      .replace(/\r?\n/g, "\\n")
+      .replace(/,/g, "\\,")
+      .replace(/;/g, "\\;");
+  }
+
+  function toUtcIcsString(date) {
+    const d = new Date(date);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    const hh = String(d.getUTCHours()).padStart(2, "0");
+    const mi = String(d.getUTCMinutes()).padStart(2, "0");
+    const ss = String(d.getUTCSeconds()).padStart(2, "0");
+    return `${yyyy}${mm}${dd}T${hh}${mi}${ss}Z`;
+  }
+
+  function buildGoogleCalendarUrl(payload) {
+    const params = new URLSearchParams({
+      action: "TEMPLATE",
+      text: payload.title,
+      dates: `${toUtcIcsString(payload.start)}/${toUtcIcsString(payload.end)}`,
+      details: payload.description || "",
+      location: payload.location || ""
+    });
+    return `https://calendar.google.com/calendar/render?${params.toString()}`;
+  }
+
+  function buildOutlookCalendarUrl(payload) {
+    const params = new URLSearchParams({
+      path: "/calendar/action/compose",
+      rru: "addevent",
+      subject: payload.title,
+      startdt: payload.start.toISOString(),
+      enddt: payload.end.toISOString(),
+      body: payload.description || "",
+      location: payload.location || ""
+    });
+    return `https://outlook.office.com/calendar/0/deeplink/compose?${params.toString()}`;
+  }
+
+  async function getCalendarPayload(ev) {
+    if (!ev) throw new Error("No event selected.");
+
+    const start = toDate(ev.start);
+    if (!start) throw new Error("Event start time not found.");
+    const end = toDate(ev.end) || new Date(start.getTime() + 60 * 60 * 1000);
+
+    let resData = null;
+    if (!(ev.address || ev.hmapsUrl || ev.mapsUrl || ev.mapsPlaceId || (isFinite(ev.lat) && isFinite(ev.lng)))) {
+      resData = await fetchResourceDataByAny(ev).catch(() => null);
+    }
+
+    const meta = pickAddrMeta(ev, resData);
+    const location = meta.address || ev.resourceName || resData?.name || "";
+
+    const detailText = stripHtmlToText(ev.detailDescription || "");
+    const descParts = [];
+    if (ev.description) descParts.push(ev.description);
+    if (detailText) descParts.push(detailText);
+    if (ev.branch) descParts.push(`Branch: ${ev.branch}`);
+    if (location) descParts.push(`Location: ${location}`);
+
+    const description = descParts.join("\n\n");
+
+    return {
+      title: ev.title || "Event",
+      start,
+      end,
+      location,
+      description
+    };
+  }
+
+  async function openGoogleCalendar() {
+    const payload = await getCalendarPayload(currentDetailEvent);
+    window.open(buildGoogleCalendarUrl(payload), "_blank", "noopener");
+  }
+
+  async function openOutlookCalendar() {
+    const payload = await getCalendarPayload(currentDetailEvent);
+    window.open(buildOutlookCalendarUrl(payload), "_blank", "noopener");
+  }
+
+  async function downloadIcsFile() {
+    const payload = await getCalendarPayload(currentDetailEvent);
+    const uid = `event-${Date.now()}@kwliving-events-private`;
+    const stamp = toUtcIcsString(new Date());
+
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//KW Living//Private Event Calendar//EN",
+      "CALSCALE:GREGORIAN",
+      "METHOD:PUBLISH",
+      "BEGIN:VEVENT",
+      `UID:${uid}`,
+      `DTSTAMP:${stamp}`,
+      `DTSTART:${toUtcIcsString(payload.start)}`,
+      `DTEND:${toUtcIcsString(payload.end)}`,
+      `SUMMARY:${escapeIcsText(payload.title)}`,
+      `DESCRIPTION:${escapeIcsText(payload.description)}`,
+      `LOCATION:${escapeIcsText(payload.location)}`,
+      "END:VEVENT",
+      "END:VCALENDAR"
+    ].join("\r\n");
+
+    const blob = new Blob([ics], { type: "text/calendar;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const safeName = (payload.title || "event")
+      .replace(/[^\w\s-]/g, "")
+      .trim()
+      .replace(/\s+/g, "_");
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${safeName || "event"}.ics`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  // ---------- Banner helpers ----------
   function pickBannerUrl(ev) {
-    // Try several common fields; prefer a smaller/thumb first if provided.
     const candidates = [
       ev.bannerThumbUrl,
       ev.bannerThumb,
       ev.bannerUrl,
-      ev.banner,               // may already be a URL string
+      ev.banner,
       ev.bannerImage,
       ev.images?.banner,
-      ev.imageUrl              // just in case it was stored this way
+      ev.imageUrl
     ].filter(Boolean);
 
     for (const raw of candidates) {
       const s = String(raw).trim();
       if (!s) continue;
-      // Accept only http(s) URLs here; storage paths would need getDownloadURL (not in this page).
       if (/^https?:\/\//i.test(s) || s.startsWith("ttps://")) {
         return ensureHttps(s);
       }
     }
-    return ""; // no usable URL
+    return "";
   }
 
   // ---------- Map helpers ----------
   function pickAddrMeta(ev, res) {
-    // Event fields take priority; then resource; then null
     const meta = {
       address     : ev.address ?? res?.address ?? null,
-      // NEW: high-accuracy deep link (short link). Event overrides resource if present.
       hmapsUrl    : ensureHttps(ev.hmapsUrl ?? res?.hmapsUrl ?? ""),
       mapsUrl     : ensureHttps(ev.mapsUrl  ?? res?.mapsUrl  ?? ""),
       mapsPlaceId : ev.mapsPlaceId ?? res?.mapsPlaceId ?? null,
@@ -177,11 +474,9 @@
   }
 
   function buildMapTargets(meta) {
-    // Always return a rock-solid link; embed only when precise (or acceptable).
     const labelPart = meta.label ? encodeURIComponent(meta.label) : "";
     const addrPart  = meta.address ? encodeURIComponent(meta.address) : "";
 
-    // Link priority: hmapsUrl > mapsUrl > placeId > lat/lng > address
     let linkUrl = "";
     if (meta.hmapsUrl) {
       linkUrl = meta.hmapsUrl;
@@ -195,7 +490,6 @@
       linkUrl = `https://www.google.com/maps?q=${labelPart ? labelPart + "%20" : ""}${addrPart}`;
     }
 
-    // Embed target (optional)
     let embedUrl = null;
     if (MAP_MODE !== "link") {
       if (MAPS_EMBED_API_KEY && meta.mapsPlaceId) {
@@ -203,7 +497,6 @@
       } else if (MAPS_EMBED_API_KEY && isFinite(meta.lat) && isFinite(meta.lng)) {
         embedUrl = `https://www.google.com/maps/embed/v1/view?key=${encodeURIComponent(MAPS_EMBED_API_KEY)}&center=${meta.lat},${meta.lng}&zoom=16&maptype=roadmap`;
       } else if (meta.address) {
-        // Fallback; could be slightly imprecise
         embedUrl = `https://www.google.com/maps?q=${addrPart}&output=embed`;
       }
     }
@@ -273,20 +566,15 @@
   function applyFilter() {
     const q = (searchInput.value || "").toLowerCase().trim();
     const brSel = (branchFilter.value || "ALL").toUpperCase();
-    theVis:
-    0
-    const visSel = (visibilityFilter?.value || "ALL").toLowerCase(); // "all" | "private" | "public"
+    const visSel = (visibilityFilter?.value || "ALL").toLowerCase();
 
     filtered = allEvents.filter(ev => {
-      // branch / location
       const br = (ev.branch || "").toUpperCase();
       if (brSel !== "ALL" && br !== brSel) return false;
 
-      // visibility
       const v = (ev.visibility || "").toLowerCase();
       if (visSel !== "all" && v !== visSel) return false;
 
-      // text search
       if (!q) return true;
       const detailTxt = stripHtmlToText(ev.detailDescription || "");
       const hay = [ev.title, ev.description, ev.resourceName, ev.branch, detailTxt]
@@ -297,36 +585,38 @@
     render();
   }
 
-  // ---------- RENDER DISPATCH ----------
+  // ---------- Render ----------
   function render() {
-    [btnMonth,btnWeek,btnDay,btnList].forEach(b=>b.classList.remove("active"));
-    if (currentView==="month") btnMonth.classList.add("active");
-    else if (currentView==="week") btnWeek.classList.add("active");
-    else if (currentView==="day") btnDay.classList.add("active");
-    else btnList.classList.add("active");
+    activeViewButton();
 
     if (currentView === "list") {
+      containerCal.style.display = "none";
+      containerList.style.display = "grid";
       renderList();
-      calLabel.textContent = "Upcoming";
-      containerCal.innerHTML = "";
+      calLabel.textContent = "All Events";
       return;
     }
 
-    containerList.innerHTML = "";
+    containerList.style.display = "none";
+    containerCal.style.display = "";
+
     if (currentView === "month") renderMonth();
     else if (currentView === "week") renderWeek();
     else renderDay();
+
+    if (contentViewport) contentViewport.scrollTo({ top: 0, behavior: "auto" });
   }
 
-  // ---------- LIST VIEW ----------
+  // ---------- List view ----------
   function renderList() {
     if (!filtered.length) {
       containerList.innerHTML = `
         <div class="text-center text-muted py-5">
-          <i class="bi bi-calendar-x me-2"></i>No upcoming events match your filters.
+          <i class="bi bi-calendar-x me-2"></i>No events match your filters.
         </div>`;
       return;
     }
+
     const groups = {};
     for (const e of filtered) {
       const d = toDate(e.start);
@@ -334,38 +624,58 @@
       const key = monthKey(d);
       (groups[key] ||= { label: monthLabel(d), events: [] }).events.push(e);
     }
+
     const parts = [];
     Object.keys(groups).sort().forEach(key => {
       const g = groups[key];
-      parts.push(`<div class="month-header">${esc(g.label)}</div>`);
+
+      g.events.sort((a, b) => {
+        const da = toDate(a.start)?.getTime() || 0;
+        const db = toDate(b.start)?.getTime() || 0;
+        return da - db;
+      });
+
+      parts.push(`<div class="month-header" data-month-key="${esc(key)}">${esc(g.label)}</div>`);
       for (const e of g.events) parts.push(renderEventCard(e));
     });
+
     containerList.innerHTML = parts.join("");
+    scrollListToCurrentDay();
   }
 
   function renderEventCard(e) {
     const start = toDate(e.start);
-    const end   = toDate(e.end);
+    const end   = toDate(e.end) || start;
     const dateLine = `${fmtDateTime(start)} – ${fmtDateTime(end)}`;
+    const thumbTopTitle = formatThumbTopTitle(start);
     const remaining = (typeof e.remaining === "number") ? e.remaining : null;
     const capacity  = (typeof e.capacity === "number") ? e.capacity : null;
     const remainTxt = (remaining != null && capacity != null)
       ? `${remaining}/${capacity} seats left`
       : (remaining != null ? `${remaining} seats left` : "");
-    const color = normalizeHex(e.color || "#3b82f6");
 
-    // --- Banner thumbnail area (always present) ---
-    const bannerUrl = pickBannerUrl(e);
-    const thumbHtml = bannerUrl
-      ? `<img src="${esc(bannerUrl)}" alt="Banner for ${esc(e.title || "event")}" loading="lazy">`
-      : `<span class="no-banner">No Banner</span>`;
+    const display = getEventDisplayColors(e);
+    const cardClass = display.past ? "event-card past" : "event-card";
+    const thumbHtml = (() => {
+      const bannerUrl = pickBannerUrl(e);
+      return bannerUrl
+        ? `<img src="${esc(bannerUrl)}" alt="Banner for ${esc(e.title || "event")}" loading="lazy">`
+        : `<span class="thumb-fallback">No Banner</span>`;
+    })();
 
     return `
-      <div class="event-card" data-id="${esc(e._id)}" role="button">
-        <div class="event-thumb">${thumbHtml}</div>
+      <div class="${cardClass}"
+           data-id="${esc(e._id)}"
+           data-start-ts="${esc(String(toDate(e.start)?.getTime() || 0))}"
+           role="button">
+        <div class="event-thumb">
+          <div class="thumb-top-title">${esc(thumbTopTitle)}</div>
+          <div class="thumb-box">${thumbHtml}</div>
+        </div>
+
         <div class="event-body">
           <div class="event-title">
-            <span style="display:inline-block;width:.7rem;height:.7rem;border-radius:50%;background:${esc(color)};margin-right:.35rem;"></span>
+            <span style="display:inline-block;width:.7rem;height:.7rem;border-radius:50%;background:${esc(display.bg)};margin-right:.35rem;"></span>
             ${esc(e.title || "Untitled Event")}
           </div>
           <div class="event-meta mt-1">
@@ -376,6 +686,7 @@
           </div>
           ${e.description ? `<div class="mt-2 text-secondary">${esc(e.description)}</div>` : ""}
         </div>
+
         <div class="event-cta small text-primary d-flex align-items-start justify-content-end">
           ${remainTxt ? `<div class="small text-muted me-3">${esc(remainTxt)}</div>` : ""}
           <div>Details &raquo;</div>
@@ -384,32 +695,17 @@
     `;
   }
 
-  // ---------- CALENDAR SHARED ----------
-  function canRegister(ev) {
-    const now = new Date();
-    if (ev.status !== "published") return false;
-    const v = (ev.visibility || "").toLowerCase();
-    if (v !== "public" && v !== "private") return false;
-    if (ev.allowRegistration === false) return false;
-    const opens = toDate(ev.regOpensAt);
-    const closes = toDate(ev.regClosesAt);
-    if (opens && now < opens) return false;
-    if (closes && now > closes) return false;
-    if (typeof ev.remaining === "number" && ev.remaining <= 0) return false;
-    const start = toDate(ev.start);
-    if (start && now > start) return false;
-    return true;
-  }
-  function overlaps(aStart, aEnd, bStart, bEnd) { return aStart < bEnd && aEnd > bStart; }
+  // ---------- Calendar shared ----------
   function eventsInRange(rangeStart, rangeEnd) {
     return filtered.filter(ev => {
-      const s = toDate(ev.start); const e = toDate(ev.end);
+      const s = toDate(ev.start);
+      const e = toDate(ev.end) || s;
       if (!s || !e) return false;
       return overlaps(s, e, rangeStart, rangeEnd);
     });
   }
 
-  // ---------- MONTH / WEEK / DAY ----------
+  // ---------- Month / Week / Day ----------
   function renderMonth() {
     const year = cursorDate.getFullYear();
     const month = cursorDate.getMonth();
@@ -417,23 +713,30 @@
     calLabel.textContent = cursorDate.toLocaleString(undefined,{month:"long", year:"numeric"});
 
     const firstOfMonth = new Date(year, month, 1);
-    const startDow = firstOfMonth.getDay();
-    const gridStart = new Date(firstOfMonth);
-    gridStart.setDate(firstOfMonth.getDate() - startDow);
-    const gridEnd = new Date(gridStart); gridEnd.setDate(gridStart.getDate() + 42);
+    const gridStart = startOfWeek(firstOfMonth);
+    const gridEnd = new Date(gridStart);
+    gridEnd.setDate(gridStart.getDate() + 42);
 
     const evs = eventsInRange(gridStart, gridEnd);
-
     const dayMap = {};
+
     for (const ev of evs) {
-      const d = truncateToDay(toDate(ev.start));
-      const key = d.toISOString();
-      (dayMap[key] ||= []).push(ev);
+      const s = toDate(ev.start);
+      const e = toDate(ev.end) || s;
+      let d = truncateToDay(s);
+      const last = truncateToDay(e);
+
+      while (d <= last) {
+        const key = d.toISOString().slice(0,10);
+        (dayMap[key] ||= []).push(ev);
+        d.setDate(d.getDate() + 1);
+      }
     }
 
     const weekdays = [];
     for (let i=0;i<7;i++) {
-      const d = new Date(gridStart); d.setDate(gridStart.getDate()+i);
+      const d = new Date(gridStart);
+      d.setDate(gridStart.getDate()+i);
       weekdays.push(`<div class="month-head">${d.toLocaleDateString(undefined,{weekday:"short"})}</div>`);
     }
 
@@ -441,27 +744,28 @@
     let iter = new Date(gridStart);
     for (let i=0;i<42;i++) {
       const isOtherMonth = iter.getMonth() !== month;
-      const key = truncateToDay(iter).toISOString();
-      const items = (dayMap[key] || []).sort((a,b)=> toDate(a.start)-toDate(b.start));
-      const dayNum = iter.getDate();
+      const key = iter.toISOString().slice(0,10);
+      const items = (dayMap[key] || []).sort((a,b)=> (toDate(a.start)?.getTime() || 0) - (toDate(b.start)?.getTime() || 0));
 
-      const evHtml = items.map(e=>{
-        const color = normalizeHex(e.color || "#3b82f6");
-        const txt = idealTextColor(color);
-        const disable = !canRegister(e) ? "full" : "";
-        return `<button class="month-evt ${disable}" data-id="${esc(e._id)}"
+      const evHtml = items.map(e => {
+        const display = getEventDisplayColors(e);
+        const disable = display.disabled ? "full" : "";
+        const pastCls = display.past ? "past" : "";
+
+        return `<button class="month-evt ${disable} ${pastCls}" data-id="${esc(e._id)}"
                         title="${esc(e.title || "")}"
-                        style="background:${esc(color)};border-color:${esc(color)};color:${esc(txt)};">
+                        style="background:${esc(display.bg)};border-color:${esc(display.border)};color:${esc(display.text)};">
                   ${esc(e.title || "Event")}
                 </button>`;
       }).join("");
 
       cells.push(`
-        <div class="month-cell ${isOtherMonth?'other':''}">
-          <div class="month-day">${dayNum}</div>
+        <div class="month-cell ${isOtherMonth ? 'other' : ''}">
+          <div class="month-day">${iter.getDate()}</div>
           ${evHtml}
         </div>
       `);
+
       iter.setDate(iter.getDate()+1);
     }
 
@@ -474,42 +778,44 @@
   }
 
   function renderWeek() {
-    const start = new Date(cursorDate);
-    start.setDate(start.getDate() - start.getDay());
-    start.setHours(0,0,0,0);
-    const end = new Date(start); end.setDate(start.getDate()+7);
+    const start = startOfWeek(cursorDate);
+    const end = addDays(start, 7);
 
     calLabel.textContent =
       `${start.toLocaleDateString(undefined,{month:"short",day:"numeric"})} – ${new Date(end-1).toLocaleDateString(undefined,{month:"short",day:"numeric",year:"numeric"})}`;
 
     const evs = eventsInRange(start, end);
-    const hours = Array.from({length:13}, (_,i)=> i+7); // 07:00 - 19:00
+    const hours = Array.from({length:13}, (_,i)=> i+7);
 
     const cols = [];
     for (let d=0; d<7; d++) {
-      const dayDate = new Date(start); dayDate.setDate(start.getDate()+d);
+      const dayDate = addDays(start, d);
       const dayStart = new Date(dayDate);
-      const dayEnd = new Date(dayDate); dayEnd.setDate(dayEnd.getDate()+1);
+      const dayEnd = addDays(dayDate, 1);
 
       const dayEvents = evs.filter(e => {
-        const s = toDate(e.start), ee = toDate(e.end);
+        const s = toDate(e.start), ee = toDate(e.end) || s;
         return overlaps(s, ee, dayStart, dayEnd);
-      }).sort((a,b)=> toDate(a.start)-toDate(b.start));
+      }).sort((a,b)=> (toDate(a.start)?.getTime() || 0) - (toDate(b.start)?.getTime() || 0));
 
       const slots = hours.map(()=>`<div class="time-slot"></div>`).join("");
 
       const pills = dayEvents.map(e=>{
-        const s = toDate(e.start), ee = toDate(e.end);
+        const s = toDate(e.start), ee = toDate(e.end) || s;
         const startHour = Math.max(0, (s.getHours() - hours[0]) + s.getMinutes()/60);
         const durHours = Math.max(0.7, ((ee - s) / (1000*60*60)));
         const top = Math.min(hours.length-0.7, startHour) * 44;
         const height = Math.min(hours.length*44 - top - 4, Math.max(20, durHours*44 - 6));
-        const full = !canRegister(e) ? "full" : "";
-        const color = normalizeHex(e.color || "#3b82f6");
-        const txt = idealTextColor(color);
-        return `<button class="evt-pill ${full}" data-id="${esc(e._id)}"
-                       style="top:${top+2}px;height:${height}px;background:${esc(color)};border-color:${esc(color)};color:${esc(txt)}"
-                       title="${esc(e.title || "")}">${esc(e.title || "Event")}</button>`;
+
+        const display = getEventDisplayColors(e);
+        const full = display.disabled ? "full" : "";
+        const pastCls = display.past ? "past" : "";
+
+        return `<button class="evt-pill ${full} ${pastCls}" data-id="${esc(e._id)}"
+                       style="top:${top+2}px;height:${height}px;background:${esc(display.bg)};border-color:${esc(display.border)};color:${esc(display.text)}"
+                       title="${esc(e.title || "")}">
+                  ${esc(e.title || "Event")}
+                </button>`;
       }).join("");
 
       cols.push(`
@@ -522,7 +828,7 @@
 
     const heads = ['','Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map((name,idx)=>{
       if (idx===0) return `<div class="time-head"></div>`;
-      const d = new Date(start); d.setDate(start.getDate()+idx-1);
+      const d = addDays(start, idx-1);
       return `<div class="time-head">${name}<br><span class="muted">${d.getMonth()+1}/${d.getDate()}</span></div>`;
     }).join("");
 
@@ -531,9 +837,7 @@
     containerCal.innerHTML = `
       <div class="time-grid">
         ${heads}
-        <div class="time-col">
-          ${labels}
-        </div>
+        <div class="time-col">${labels}</div>
         ${cols.join("")}
       </div>
     `;
@@ -541,25 +845,27 @@
 
   function renderDay() {
     const start = truncateToDay(cursorDate);
-    const end = new Date(start); end.setDate(start.getDate()+1);
+    const end = addDays(start, 1);
 
     calLabel.textContent = fmtDate(start);
 
-    const evs = eventsInRange(start, end).sort((a,b)=> toDate(a.start)-toDate(b.start));
+    const evs = eventsInRange(start, end).sort((a,b)=> (toDate(a.start)?.getTime() || 0) - (toDate(b.start)?.getTime() || 0));
     const hours = Array.from({length:13}, (_,i)=> i+7);
 
     const slots = hours.map(()=>`<div class="time-slot"></div>`).join("");
     const pills = evs.map(e=>{
-      const s = toDate(e.start), ee = toDate(e.end);
+      const s = toDate(e.start), ee = toDate(e.end) || s;
       const startHour = Math.max(0, (s.getHours() - hours[0]) + s.getMinutes()/60);
       const durHours = Math.max(0.7, ((ee - s) / (1000*60*60)));
       const top = Math.min(hours.length-0.7, startHour) * 44;
       const height = Math.min(hours.length*44 - top - 4, Math.max(20, durHours*44 - 6));
-      const full = !canRegister(e) ? "full" : "";
-      const color = normalizeHex(e.color || "#3b82f6");
-      const txt = idealTextColor(color);
-      return `<button class="evt-pill ${full}" data-id="${esc(e._id)}"
-                     style="top:${top+2}px;height:${height}px;background:${esc(color)};border-color:${esc(color)};color:${esc(txt)}"
+
+      const display = getEventDisplayColors(e);
+      const full = display.disabled ? "full" : "";
+      const pastCls = display.past ? "past" : "";
+
+      return `<button class="evt-pill ${full} ${pastCls}" data-id="${esc(e._id)}"
+                     style="top:${top+2}px;height:${height}px;background:${esc(display.bg)};border-color:${esc(display.border)};color:${esc(display.text)}"
                      title="${esc(e.title || "")}">
                 ${esc(e.title || "Event")}
               </button>`;
@@ -576,9 +882,7 @@
     containerCal.innerHTML = `
       <div class="time-grid">
         ${head}
-        <div class="time-col">
-          ${labels}
-        </div>
+        <div class="time-col">${labels}</div>
         <div class="time-col position-relative" style="grid-column: span 7;">
           ${slots}
           ${pills}
@@ -587,7 +891,7 @@
     `;
   }
 
-  // ---------- Resource fetch (robust) ----------
+  // ---------- Resource fetch ----------
   async function fetchResourceDataByAny(ev) {
     const rid = ev.resourceId || ev.resourceID || ev.resource || null;
     const rname = ev.resourceName || null;
@@ -639,30 +943,30 @@
     return null;
   }
 
-  // ---------- Event Details Modal ----------
+  // ---------- Modal ----------
   function openEventDetails(ev) {
-    const s = toDate(ev.start), e = toDate(ev.end);
+    const s = toDate(ev.start), e = toDate(ev.end) || s;
     const dateLine = `${fmtDateTime(s)} – ${fmtDateTime(e)}`;
     const remainTxt = (typeof ev.remaining === "number" && typeof ev.capacity === "number")
       ? `${ev.remaining}/${ev.capacity} seats left`
       : (typeof ev.remaining === "number" ? `${ev.remaining} seats left` : "");
     const canReg = canRegister(ev);
-    const color = normalizeHex(ev.color || "#3b82f6");
+    const display = getEventDisplayColors(ev);
+
+    currentDetailEvent = ev;
 
     if (evTitleEl) {
       evTitleEl.innerHTML = `
-        <span class="me-2" style="display:inline-block;width:.9rem;height:.9rem;border-radius:50%;background:${esc(color)};vertical-align:baseline;"></span>
+        <span class="me-2" style="display:inline-block;width:.9rem;height:.9rem;border-radius:50%;background:${esc(display.bg)};vertical-align:baseline;"></span>
         ${esc(ev.title || "Event Details")}
       `;
     }
 
-    // NEW: set banner in modal (under the title)
+    const url = pickBannerUrl(ev);
     if (evBannerWrap && evBannerImg) {
-      const url = pickBannerUrl(ev);
       if (url) {
-        evBannerImg.onload = null; // reset previous handlers
+        evBannerImg.onload = null;
         evBannerImg.onerror = () => {
-          // hide the banner slot if the image fails to load
           evBannerImg.removeAttribute("src");
           evBannerWrap.classList.add("d-none");
         };
@@ -686,7 +990,6 @@
 
     if (evDateLineEl) evDateLineEl.textContent = dateLine;
 
-    // Address / map: event → resource → hide
     evAddressRow?.classList.add("d-none");
     evAddressText.textContent = "";
     evMapEmbed?.classList.add("d-none");
@@ -705,13 +1008,21 @@
     }
 
     if (evShortDescEl) {
-      if (ev.description) { evShortDescEl.textContent = ev.description; evShortDescEl.style.display = ""; }
-      else { evShortDescEl.style.display = "none"; }
+      if (ev.description) {
+        evShortDescEl.textContent = ev.description;
+        evShortDescEl.style.display = "";
+      } else {
+        evShortDescEl.style.display = "none";
+      }
     }
 
     if (evDetailDescEl) {
-      if (ev.detailDescription) { evDetailDescEl.innerHTML = ev.detailDescription; evDetailDescEl.style.display = ""; }
-      else { evDetailDescEl.style.display = "none"; }
+      if (ev.detailDescription) {
+        evDetailDescEl.innerHTML = ev.detailDescription;
+        evDetailDescEl.style.display = "";
+      } else {
+        evDetailDescEl.style.display = "none";
+      }
     }
 
     if (evCapacityEl) evCapacityEl.textContent = remainTxt || "";
@@ -753,8 +1064,7 @@
 
     if (set.size === 0) {
       try {
-        const now = new Date();
-        const evSnap = await window.db.collection("events").where("start", ">=", now).get();
+        const evSnap = await window.db.collection("events").get();
         evSnap.forEach(d => {
           const ev = d.data();
           if (ev?.status === "published") {
@@ -774,18 +1084,18 @@
   }
 
   function attachEventsListener() {
-    if (typeof unsubscribeEvents === "function") { unsubscribeEvents(); unsubscribeEvents = null; }
+    if (typeof unsubscribeEvents === "function") {
+      unsubscribeEvents();
+      unsubscribeEvents = null;
+    }
 
-    const now = new Date();
     const col = window.db.collection("events");
 
     try {
-      // Preferred: visibility in ["public","private"], status == "published", start >= now, orderBy start
       unsubscribeEvents = col
         .where("visibility", "in", ["public","private"])
         .where("status","==","published")
-        .where("start",">=", now)
-        .orderBy("start","asc")
+        .orderBy("start","desc")
         .onSnapshot(snap => {
           allEvents = snap.docs.map(d => ({ _id: d.id, ...d.data() }));
           applyFilter();
@@ -800,41 +1110,31 @@
   }
 
   function fallbackEventsListener() {
-    const now = new Date();
     const col = window.db.collection("events");
 
     try {
-      unsubscribeEvents = col
-        .where("start", ">=", now)
-        .orderBy("start", "asc")
-        .onSnapshot(snap => {
-          const rows = snap.docs.map(d => ({ _id: d.id, ...d.data() }));
-          allEvents = rows.filter(ev =>
-            ev.status === "published" &&
-            (ev.visibility === "public" || ev.visibility === "private")
-          );
-          applyFilter();
-        }, err => {
-          console.error("internal events fallback failed; trying one-time get:", err);
-          col.where("start", ">=", now).orderBy("start","asc").get().then(snap2 => {
-            const rows2 = snap2.docs.map(d => ({ _id: d.id, ...d.data() }));
-            allEvents = rows2.filter(ev =>
-              ev.status === "published" &&
-              (ev.visibility === "public" || ev.visibility === "private")
-            );
-            applyFilter();
-          }).catch(err2 => {
-            console.error("internal events one-time fallback failed:", err2);
-            containerList.innerHTML = `<div class="text-danger py-4 text-center">Failed to load events.</div>`;
-          });
+      unsubscribeEvents = col.onSnapshot(snap => {
+        const rows = snap.docs.map(d => ({ _id: d.id, ...d.data() }));
+        allEvents = rows.filter(ev =>
+          ev.status === "published" &&
+          (ev.visibility === "public" || ev.visibility === "private")
+        ).sort((a,b) => {
+          const da = toDate(a.start)?.getTime() || 0;
+          const db = toDate(b.start)?.getTime() || 0;
+          return db - da;
         });
+        applyFilter();
+      }, err => {
+        console.error("internal events fallback failed:", err);
+        containerList.innerHTML = `<div class="text-danger py-4 text-center">Failed to load events.</div>`;
+      });
     } catch (err) {
       console.error("internal events fallback threw:", err);
       containerList.innerHTML = `<div class="text-danger py-4 text-center">Failed to load events.</div>`;
     }
   }
 
-  // ---------- Registration submit ----------
+  // ---------- Registration ----------
   regForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     clearRegAlerts();
@@ -858,20 +1158,18 @@
         if (!evSnap.exists) throw new Error("Event not found.");
         const ev = evSnap.data();
 
-        if (ev.status !== "published") {
-          throw new Error("Registration is closed for this event.");
-        }
+        if (ev.status !== "published") throw new Error("Registration is closed for this event.");
         const v = (ev.visibility || "").toLowerCase();
-        if (v !== "public" && v !== "private") {
-          throw new Error("Registration is not available for this event.");
-        }
+        if (v !== "public" && v !== "private") throw new Error("Registration is not available for this event.");
 
         const now = new Date();
         const opens = ev.regOpensAt?.toDate ? ev.regOpensAt.toDate() : (ev.regOpensAt ? new Date(ev.regOpensAt) : null);
         const closes = ev.regClosesAt?.toDate ? ev.regClosesAt.toDate() : (ev.regClosesAt ? new Date(ev.regClosesAt) : null);
+
         if (ev.allowRegistration === false) throw new Error("Registration is not allowed for this event.");
         if (opens && now < opens) throw new Error("Registration has not opened yet.");
         if (closes && now > closes) throw new Error("Registration has closed.");
+
         const start = ev.start?.toDate ? ev.start.toDate() : (ev.start ? new Date(ev.start) : null);
         if (start && now > start) throw new Error("This event has already started.");
 
@@ -918,33 +1216,102 @@
     }
   });
 
-  // ---------- View navigation ----------
-  function gotoToday(){ cursorDate = truncateToDay(new Date()); render(); }
-  function prevPeriod(){
-    if (currentView === "month"){ const d=new Date(cursorDate); d.setMonth(d.getMonth()-1); cursorDate=truncateToDay(d); }
-    else if (currentView === "week"){ const d=new Date(cursorDate); d.setDate(d.getDate()-7); cursorDate=truncateToDay(d); }
-    else if (currentView === "day"){ const d=new Date(cursorDate); d.setDate(d.getDate()-1); cursorDate=truncateToDay(d); }
-    render();
+  // ---------- Add to Calendar ----------
+  if (addCalGoogle) {
+    addCalGoogle.addEventListener("click", async () => {
+      try {
+        await openGoogleCalendar();
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Unable to add this event to Google Calendar.");
+      }
+    });
   }
-  function nextPeriod(){
-    if (currentView === "month"){ const d=new Date(cursorDate); d.setMonth(d.getMonth()+1); cursorDate=truncateToDay(d); }
-    else if (currentView === "week"){ const d=new Date(cursorDate); d.setDate(d.getDate()+7); cursorDate=truncateToDay(d); }
-    else if (currentView === "day"){ const d=new Date(cursorDate); d.setDate(d.getDate()+1); cursorDate=truncateToDay(d); }
+
+  if (addCalOutlook) {
+    addCalOutlook.addEventListener("click", async () => {
+      try {
+        await openOutlookCalendar();
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Unable to add this event to Outlook.");
+      }
+    });
+  }
+
+  if (addCalIcs) {
+    addCalIcs.addEventListener("click", async () => {
+      try {
+        await downloadIcsFile();
+      } catch (err) {
+        console.error(err);
+        alert(err.message || "Unable to download calendar file.");
+      }
+    });
+  }
+
+  // ---------- Navigation ----------
+  function gotoToday() {
+    cursorDate = truncateToDay(new Date());
     render();
   }
 
-  // ---------- Event Delegation ----------
+  function prevPeriod() {
+    if (currentView === "month") {
+      const d = new Date(cursorDate);
+      d.setMonth(d.getMonth()-1);
+      cursorDate = truncateToDay(d);
+    } else if (currentView === "week") {
+      const d = new Date(cursorDate);
+      d.setDate(d.getDate()-7);
+      cursorDate = truncateToDay(d);
+    } else if (currentView === "day") {
+      const d = new Date(cursorDate);
+      d.setDate(d.getDate()-1);
+      cursorDate = truncateToDay(d);
+    }
+    render();
+  }
+
+  function nextPeriod() {
+    if (currentView === "month") {
+      const d = new Date(cursorDate);
+      d.setMonth(d.getMonth()+1);
+      cursorDate = truncateToDay(d);
+    } else if (currentView === "week") {
+      const d = new Date(cursorDate);
+      d.setDate(d.getDate()+7);
+      cursorDate = truncateToDay(d);
+    } else if (currentView === "day") {
+      const d = new Date(cursorDate);
+      d.setDate(d.getDate()+1);
+      cursorDate = truncateToDay(d);
+    }
+    render();
+  }
+
+  // ---------- Delegation ----------
   document.addEventListener("click", (ev) => {
     const card = ev.target.closest(".event-card");
     const monthBtn = ev.target.closest(".month-evt");
     const pill = ev.target.closest(".evt-pill");
     const el = card || monthBtn || pill;
     if (!el) return;
+
     const id = el.getAttribute("data-id");
     if (!id) return;
+
     const eventObj = allEvents.find(x => x._id === id);
     if (!eventObj) return;
+
     openEventDetails(eventObj);
+  });
+
+  // ---------- Restore ----------
+  window.addEventListener("pageshow", function(event) {
+    if (event.persisted) {
+      forceDefaultMonthView();
+    }
   });
 
   // ---------- Init ----------
@@ -954,10 +1321,12 @@
       return;
     }
 
+    currentView = "month";
+    cursorDate = truncateToDay(new Date());
+
     await loadBranches();
     attachEventsListener();
 
-    // Filters/search
     branchFilter.addEventListener("change", applyFilter);
     visibilityFilter.addEventListener("change", applyFilter);
     searchInput.addEventListener("input", () => {
@@ -965,15 +1334,15 @@
       searchInput._t = setTimeout(applyFilter, 120);
     });
 
-    // View switch
     btnMonth.addEventListener("click", () => { currentView="month"; render(); });
     btnWeek .addEventListener("click", () => { currentView="week";  render(); });
     btnDay  .addEventListener("click", () => { currentView="day";   render(); });
     btnList .addEventListener("click", () => { currentView="list";  render(); });
 
-    // Date nav
     btnToday.addEventListener("click", gotoToday);
     btnPrev .addEventListener("click", prevPeriod);
     btnNext .addEventListener("click", nextPeriod);
+
+    render();
   });
 })();
